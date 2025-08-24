@@ -27,11 +27,34 @@ from jiwer import (
     RemoveMultipleSpaces,
     Strip,
 )
+import re
+from datetime import datetime
+import time
 
-
-TEXT_NORM = Compose(
+BASIC_NORM = Compose(
     [ToLowerCase(), RemovePunctuation(), RemoveMultipleSpaces(), Strip()]
 )
+
+
+def TEXT_NORM(x):
+    # 1) flatten to a single string
+    if isinstance(x, list):
+        x = " ".join(x)
+    elif x is None:
+        x = ""
+
+    # 2) basic normalization (may return str or list[str] depending on jiwer internals)
+    y = BASIC_NORM(x)
+
+    # 3) ensure string after BASIC_NORM
+    if isinstance(y, list):
+        y = " ".join(y)
+    if y is None:
+        y = ""
+
+    # 4) tokenize to words and wrap as list-of-list
+    tokens = re.split(r"\s+", y.strip()) if y.strip() else []
+    return [tokens]
 
 
 def list_wavs(folder: Path) -> List[Path]:
@@ -99,21 +122,28 @@ def compute_wer(
             reference_transform=TEXT_NORM,
             hypothesis_transform=TEXT_NORM,
         )
+        ref_len = (
+            getattr(m, "hits", 0)
+            + getattr(m, "substitutions", 0)
+            + getattr(m, "deletions", 0)
+        )
+
         file_rows.append(
             {
                 "filename": fn,
-                "wer": m["wer"],
-                "hits": m["hits"],
-                "substitutions": m["substitutions"],
-                "deletions": m["deletions"],
-                "insertions": m["insertions"],
-                "ref_len": m["reference_length"],
+                "wer": m.wer,
+                "hits": m.hits,
+                "substitutions": m.substitutions,
+                "deletions": m.deletions,
+                "insertions": m.insertions,
+                "ref_len": ref_len,
             }
         )
-        total_sub += m["substitutions"]
-        total_del += m["deletions"]
-        total_ins += m["insertions"]
-        total_ref += m["reference_length"]
+
+        total_sub += m.substitutions
+        total_del += m.deletions
+        total_ins += m.insertions
+        total_ref += ref_len
     overall = (total_sub + total_del + total_ins) / max(total_ref, 1)
     return file_rows, overall
 
@@ -189,7 +219,9 @@ def main():
             print("У папці немає .wav", file=sys.stderr)
             sys.exit(1)
         for i, p in enumerate(wavs, 1):
-            print(f"[{i}/{len(wavs)}] Transcribing {p.name} ...")
+            t0 = time.time()
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"[{i}/{len(wavs)}] {now}  →  Transcribing {p.name} ...")
             text, meta = transcribe_one(
                 model, p, language=args.language, beam_size=args.beam_size, vad=args.vad
             )
@@ -200,12 +232,27 @@ def main():
                     **{k: v for k, v in meta.items() if v is not None},
                 }
             )
+            dt = time.time() - t0
+            done_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"[{i}/{len(wavs)}] {done_now}  ✓  {p.name}  ({dt:.2f}s)")
+
         if not args.out:
             args.out = Path("transcribed.csv")
         save_table(rows, args.out)
         print(args.out)
 
-    # Оцінка WER (за бажанням)
+        def _to_float(x):
+            try:
+                return float(x)
+            except Exception:
+                return 0.0
+
+        total_s = sum(_to_float(r.get("duration")) for r in rows)
+        print(
+            f"[INFO] Завершено: {len(rows)} файлів. Сумарна тривалість аудіо ~ {total_s:.1f}s"
+        )
+
+    # Оцінка WER
     if args.gt:
         gt_map = load_gt(args.gt)
         hyp_map = {r["filename"]: r["text"] for r in rows}
@@ -223,11 +270,8 @@ if __name__ == "__main__":
     main()
 
 
-
 # python stt_script.py --file british_demo.wav --out stt_british_demo.json  --model-size small
 
 # python stt_script.py  --dir art-of-war   --out art-of-war/stt_transcribed.csv --model-size small --beam-size 5 --vad
 
 # python stt_script.py --dir 130732 --out 130732/transcribed.csv --gt 130732/gt.csv --model-size small --beam-size 5 --vad
-
-
