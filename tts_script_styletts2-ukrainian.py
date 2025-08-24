@@ -1,47 +1,27 @@
 #!/usr/bin/env python3
-# tts_script.py — StyleTTS2 (Ukrainian) via Hugging Face Spaces / gradio_client
-# Usage examples:
-#   # 1) Simple (one sentence)
-#   python tts_script.py --text "Привіт, світ" --outdir out
+# tts_script_styletts2-ukrainian.py
+# Unified TTS:
+#  - UKR via HF Space "patriotyk/styletts2-ukrainian" (gradio_client)
+#  - EN (British) via Parler-TTS (local)
 #
-#   # 2) Batch from CSV (columns: id?, text, voice_name?, model_name?, speed?)
-#   python tts_script.py --in data.csv --outdir out
-#
-#   # 3) Batch from JSON (list of objects with the same fields)
-#   python tts_script.py --in data.json --outdir out
-#
-# Optional flags:
-#   --model-name multi            (default used for /synthesize)
-#   --voice-name "Артем Окороков" (default voice; depends on space)
-#   --speed 1.0                   (float, 0.5..2.0 usually)
-#   --api verbalize|synthesize    (auto: uses 'synthesize' if any voice/model/speed is set)
-#   --endpoint patriotyk/styletts2-ukrainian  (HF space id)
-#
-# Dependencies:
-#   pip install gradio_client requests soundfile
+# Examples:
+#   # Single line (Space, UA)
+#   python tts_script_styletts2-ukrainian.py --text "Привіт! Тест." --outdir out
+#   # Single line (Parler, EN)
+#   python tts_script_styletts2-ukrainian.py --text "Good evening." --outdir out --engine parler
+#   # Batch JSON/CSV mixed (per-row routing by "engine" or "language")
+#   python tts_script_styletts2-ukrainian.py --in franko.json --outdir franko-modern
 
-import argparse
-import base64
-import csv
-import json
-import os
-import re
-import sys
+import argparse, base64, csv, json, re, sys
 from pathlib import Path
-from typing import Dict, List, Optional, Any
-
-import requests
-from gradio_client import Client
+from typing import Any, Dict, List, Optional
 
 
-# ---------- utils ----------
-
-
+# --------- common utils ---------
 def slugify(s: str, maxlen: int = 64) -> str:
     s = re.sub(r"[^\w\s-]", "", s, flags=re.UNICODE)
     s = re.sub(r"[\s]+", "_", s.strip())
-    s = s[:maxlen]
-    return s or "utt"
+    return s[:maxlen] or "utt"
 
 
 def read_items(path: Path) -> List[Dict[str, Any]]:
@@ -56,9 +36,11 @@ def read_items(path: Path) -> List[Dict[str, Any]]:
                     {
                         "id": (row.get("id") or "").strip(),
                         "text": text,
-                        "voice_name": (row.get("voice_name") or "").strip() or None,
-                        "model_name": (row.get("model_name") or "").strip() or None,
+                        "voice_name": (row.get("voice_name") or None),
+                        "model_name": (row.get("model_name") or None),
                         "speed": float(row["speed"]) if row.get("speed") else None,
+                        "language": (row.get("language") or None),
+                        "engine": (row.get("engine") or None),  # "space" | "parler"
                     }
                 )
     elif path.suffix.lower() == ".json":
@@ -66,7 +48,7 @@ def read_items(path: Path) -> List[Dict[str, Any]]:
         if isinstance(data, dict) and "items" in data:
             data = data["items"]
         if not isinstance(data, list):
-            raise ValueError("JSON must be a list of objects or have key 'items'.")
+            raise ValueError("JSON must be a list or have key 'items'.")
         for obj in data:
             text = (obj.get("text") or "").strip()
             if not text:
@@ -75,11 +57,13 @@ def read_items(path: Path) -> List[Dict[str, Any]]:
                 {
                     "id": (obj.get("id") or "").strip(),
                     "text": text,
-                    "voice_name": (obj.get("voice_name") or None),
-                    "model_name": (obj.get("model_name") or None),
+                    "voice_name": obj.get("voice_name"),
+                    "model_name": obj.get("model_name"),
                     "speed": (
                         float(obj["speed"]) if obj.get("speed") is not None else None
                     ),
+                    "language": obj.get("language"),
+                    "engine": obj.get("engine"),
                 }
             )
     else:
@@ -87,17 +71,22 @@ def read_items(path: Path) -> List[Dict[str, Any]]:
     return items
 
 
+def write_bytes(out_path: Path, data: bytes) -> Path:
+    out_path.write_bytes(data)
+    return out_path
+
+
+# --------- Space (UA) helpers ---------
 def _is_data_uri(s: str) -> bool:
     return isinstance(s, str) and s.startswith("data:audio/")
 
 
-def _maybe_decode_data_uri_to_bytes(s: str) -> Optional[bytes]:
-    if not _is_data_uri(s):
-        return None
+def _decode_data_uri(s: str) -> Optional[bytes]:
     try:
-        # expected format: data:audio/wav;base64,<payload>
         b64 = s.split(",", 1)[1]
-        return base64.b64decode(b64)
+        import base64 as _b
+
+        return _b.b64decode(b64)
     except Exception:
         return None
 
@@ -106,6 +95,8 @@ def _maybe_download(url: str) -> Optional[bytes]:
     if not (isinstance(url, str) and url.startswith("http")):
         return None
     try:
+        import requests
+
         r = requests.get(url, timeout=30)
         r.raise_for_status()
         return r.content
@@ -113,73 +104,140 @@ def _maybe_download(url: str) -> Optional[bytes]:
         return None
 
 
-def save_audio_result(result: Any, out_path: Path) -> Path:
+def space_save_result(result: Any, out_path: Path) -> Path:
     """
-    Attempts to persist whatever the Space returns:
-      - data URI base64 (string)
-      - HTTP URL (string)
-      - local temp file path (string)
-      - dict with "audio" (data URI) or "path"/"filepath"
-    Returns the final path written.
+    Persist Space outputs:
+    - bytes / bytearray
+    - dict with audio/url/path/filepath/data
+    - list/tuple -> first valid
+    - objects with .url/.path/.filepath/.name
+    - string:
+        * data:audio/...;base64,...
+        * http(s)://...
+        * local path
+        * JSON-like string (parse then recurse)
+        * strings containing 'file=/...wav' or embedded URL
     """
-    # 1) dict variants
+    # 0) bytes
+    if isinstance(result, (bytes, bytearray)):
+        out_path.write_bytes(result)
+        return out_path
+
+    # 1) dict
     if isinstance(result, dict):
-        # common: {"audio": "data:audio/wav;base64,...."}
-        if "audio" in result and isinstance(result["audio"], str):
-            data = _maybe_decode_data_uri_to_bytes(result["audio"])
+        val = (
+            result.get("audio")
+            or result.get("url")
+            or result.get("path")
+            or result.get("filepath")
+        )
+        if isinstance(val, str):
+            if _is_data_uri(val):
+                data = _decode_data_uri(val)
+                if data:
+                    out_path.write_bytes(data)
+                    return out_path
+            data = _maybe_download(val)
             if data:
                 out_path.write_bytes(data)
                 return out_path
-        # some spaces: {"filepath": "/tmp/xyz.wav"} or {"path": "/tmp/xyz.wav"}
-        for k in ("filepath", "path"):
-            p = result.get(k)
-            if isinstance(p, str) and Path(p).exists():
-                return _copy_file(Path(p), out_path)
+            p = Path(val)
+            if p.exists() and p.is_file():
+                out_path.write_bytes(p.read_bytes())
+                return out_path
+        if "data" in result:
+            return space_save_result(result["data"], out_path)
 
-    # 2) string variants
+    # 2) list/tuple
+    if isinstance(result, (list, tuple)):
+        for item in result:
+            try:
+                return space_save_result(item, out_path)
+            except Exception:
+                pass
+
+    # 3) object with attrs
+    for attr in ("url", "path", "filepath", "name"):
+        if hasattr(result, attr):
+            val = getattr(result, attr)
+            if isinstance(val, str):
+                if _is_data_uri(val):
+                    data = _decode_data_uri(val)
+                    if data:
+                        out_path.write_bytes(data)
+                        return out_path
+                data = _maybe_download(val)
+                if data:
+                    out_path.write_bytes(data)
+                    return out_path
+                p = Path(val)
+                if p.exists() and p.is_file():
+                    out_path.write_bytes(p.read_bytes())
+                    return out_path
+
+    # 4) string
     if isinstance(result, str):
-        # data URI
-        data = _maybe_decode_data_uri_to_bytes(result)
-        if data:
-            out_path.write_bytes(data)
-            return out_path
-        # remote URL
-        data = _maybe_download(result)
-        if data:
-            out_path.write_bytes(data)
-            return out_path
-        # local path
-        p = Path(result)
+        s = result.strip()
+
+        # 4a) data URI
+        if _is_data_uri(s):
+            data = _decode_data_uri(s)
+            if data:
+                out_path.write_bytes(data)
+                return out_path
+
+        # 4b) looks like JSON? try parse & recurse
+        if (s.startswith("{") and s.endswith("}")) or (
+            s.startswith("[") and s.endswith("]")
+        ):
+            try:
+                return space_save_result(json.loads(s), out_path)
+            except Exception:
+                pass
+
+        # 4c) embedded URL
+        import re as _re
+
+        m = _re.search(r"https?://\S+", s)
+        if m:
+            url = m.group(0).rstrip("',\") ]}")
+            data = _maybe_download(url)
+            if data:
+                out_path.write_bytes(data)
+                return out_path
+
+        # 4d) file=/… or path=/…
+        m2 = _re.search(r"(?:file|path|filepath)\s*=\s*([^\s,'\")]+)", s)
+        if m2:
+            p = Path(m2.group(1))
+            if p.exists() and p.is_file():
+                out_path.write_bytes(p.read_bytes())
+                return out_path
+
+        # 4e) treat as local path
+        p = Path(s)
         if p.exists() and p.is_file():
-            return _copy_file(p, out_path)
+            out_path.write_bytes(p.read_bytes())
+            return out_path
 
-    # 3) unsupported
-    raise ValueError("Unrecognized result format from space; cannot save audio.")
-
-
-def _copy_file(src: Path, dst: Path) -> Path:
-    if src.resolve() == dst.resolve():
-        return dst
-    dst.write_bytes(src.read_bytes())
-    return dst
+    raise ValueError(
+        f"Unrecognized Space result; cannot save audio. Got type={type(result)} and value preview={str(result)[:160]!r}"
+    )
 
 
-# ---------- TTS call(s) ----------
-
-
-def call_verbalize(client: Client, text: str) -> Any:
-    # Minimal endpoint that just takes text
-    return client.predict(text=text, api_name="/verbalize")
-
-
-def call_synthesize(
-    client: Client,
+def space_call(
+    endpoint: str,
+    api: str,
     text: str,
     model_name: Optional[str],
     voice_name: Optional[str],
     speed: Optional[float],
 ) -> Any:
-    # The space expects at least model_name + text; voice_name/speed optional
+    from gradio_client import Client
+
+    client = Client(endpoint)
+    if api == "verbalize":
+        return client.predict(text=text, api_name="/verbalize")
     payload = {
         "model_name": model_name or "multi",
         "text": text,
@@ -189,33 +247,75 @@ def call_synthesize(
     return client.predict(**payload, api_name="/synthesize")
 
 
-# ---------- main ----------
+# --------- Parler (EN British) helpers ---------
+class ParlerBritish:
+    _model = None
+    _tok = None
+    _sr = None
+
+    @classmethod
+    def ensure_loaded(cls, model_id: str = "parler-tts/parler_tts_mini_v0.1"):
+        if cls._model is None:
+            from parler_tts import ParlerTTSForConditionalGeneration
+            from transformers import AutoTokenizer
+            import torch
+
+            cls._model = ParlerTTSForConditionalGeneration.from_pretrained(model_id)
+            cls._model = cls._model.to("cuda" if torch.cuda.is_available() else "cpu")
+            cls._tok = AutoTokenizer.from_pretrained(model_id)
+            cls._sr = cls._model.config.sampling_rate
+
+    @classmethod
+    def synth(cls, text: str, description: Optional[str] = None) -> bytes:
+        import torch, numpy as np, soundfile as sf, io
+
+        cls.ensure_loaded()
+        desc = description or (
+            "A British male speaker with a clear, neutral accent, natural pacing, "
+            "calm tone, very clear audio, minimal room reverb."
+        )
+        input_ids = cls._tok(desc, return_tensors="pt").input_ids.to(cls._model.device)
+        prompt_ids = cls._tok(text, return_tensors="pt").input_ids.to(cls._model.device)
+        with torch.no_grad():
+            audio = cls._model.generate(
+                input_ids=input_ids, prompt_input_ids=prompt_ids
+            )
+        audio_np = audio.cpu().numpy().squeeze()
+        buf = io.BytesIO()
+        sf.write(buf, audio_np, cls._sr, format="WAV")
+        return buf.getvalue()
 
 
+# --------- routing ---------
+def pick_engine(
+    global_engine: Optional[str], language: Optional[str], row_engine: Optional[str]
+) -> str:
+    # explicit per-row engine wins
+    if row_engine in ("space", "parler"):
+        return row_engine
+    # global override
+    if global_engine in ("space", "parler"):
+        return global_engine
+    # heuristic by language
+    if language and language.lower().startswith(("en", "en-")):
+        return "parler"
+    return "space"
+
+
+# --------- main ---------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--text", help="One-shot text to synthesize")
-    ap.add_argument(
-        "--in", dest="in_path", type=Path, help="CSV/JSON with rows of text/params"
-    )
-    ap.add_argument(
-        "--outdir", type=Path, required=True, help="Output directory for .wav files"
-    )
-    ap.add_argument(
-        "--endpoint",
-        default="patriotyk/styletts2-ukrainian",
-        help="Hugging Face Space id",
-    )
-    ap.add_argument(
-        "--api",
-        choices=["verbalize", "synthesize"],
-        help="Force specific API; default=auto",
-    )
-    ap.add_argument(
-        "--model-name", help="Default model_name for synthesize (e.g., 'multi')"
-    )
-    ap.add_argument("--voice-name", help="Default voice_name")
-    ap.add_argument("--speed", type=float, help="Default speed (e.g., 1.0)")
+    ap.add_argument("--text", help="Single text to synthesize")
+    ap.add_argument("--in", dest="in_path", type=Path, help="CSV/JSON with rows")
+    ap.add_argument("--outdir", type=Path, required=True, help="Directory for .wav output")
+    # Space (UA)
+    ap.add_argument("--endpoint", default="patriotyk/styletts2-ukrainian", help="HF Space id")
+    ap.add_argument("--api", choices=["verbalize", "synthesize"], help="Force Space API (default auto)")
+    ap.add_argument("--model-name", help="Space model_name (default multi)")
+    ap.add_argument("--voice-name", help="Space voice_name (default Артем Окороков)")
+    ap.add_argument("--speed", type=float, help="Space speed (default 1.0)")
+    # Global engine override
+    ap.add_argument("--engine", choices=["space", "parler"], help="Force engine for all rows")
     args = ap.parse_args()
 
     if not args.text and not args.in_path:
@@ -223,71 +323,69 @@ def main():
 
     args.outdir.mkdir(parents=True, exist_ok=True)
 
-    # init client once
-    client = Client(args.endpoint)
-
     def run_one(
         text: str,
         out_file: Path,
-        model_name: Optional[str] = None,
+        language: Optional[str] = None,
+        row_engine: Optional[str] = None,
         voice_name: Optional[str] = None,
+        model_name: Optional[str] = None,
         speed: Optional[float] = None,
     ):
-        # choose API
-        use_api = args.api
-        if not use_api:
-            # auto: if any of voice/model/speed provided (globally or locally) -> synthesize, else verbalize
-            any_adv = (
-                model_name
-                or args.model_name
-                or voice_name
-                or args.voice_name
-                or speed is not None
-                or args.speed is not None
-            )
-            use_api = "synthesize" if any_adv else "verbalize"
-
-        if use_api == "verbalize":
-            result = call_verbalize(client, text=text)
+        eng = pick_engine(args.engine, language, row_engine)
+        if eng == "parler":
+            wav_bytes = ParlerBritish.synth(text)
+            write_bytes(out_file, wav_bytes)
         else:
-            result = call_synthesize(
-                client,
-                text=text,
-                model_name=model_name or args.model_name or "multi",
-                voice_name=voice_name or args.voice_name or "Артем Окороков",
-                speed=(
-                    speed
-                    if speed is not None
-                    else (args.speed if args.speed is not None else 1.0)
-                ),
+            # Space: auto-pick API
+            api = args.api or (
+                "synthesize"
+                if (voice_name or model_name or speed or args.voice_name or args.model_name or args.speed)
+                else "verbalize"
             )
-
-        save_audio_result(result, out_file)
+            res = space_call(
+                endpoint=args.endpoint,
+                api=api,
+                text=text,
+                model_name=(model_name or args.model_name or "multi"),
+                voice_name=(voice_name or args.voice_name or "Артем Окороков"),
+                speed=(speed if speed is not None else (args.speed if args.speed is not None else 1.0)),
+            )
+            space_save_result(res, out_file)
         print(out_file)
 
-    # single text mode
+    # single
     if args.text:
-        name = slugify(args.text[:50])
-        out = args.outdir / f"{name}.wav"
+        out = args.outdir / f"{slugify(args.text[:50])}.wav"
         run_one(args.text, out)
         return
 
-    # batch mode
-    items = read_items(args.in_path)
-    if not items:
+    # batch
+    rows = read_items(args.in_path)
+    if not rows:
         print("No valid rows in input.", file=sys.stderr)
         sys.exit(1)
 
-    for i, it in enumerate(items, 1):
-        name = it.get("id") or slugify(it["text"][:50])
-        out = args.outdir / f"{i:03d}_{name}.wav"
+    seen = set()
+    for r in rows:
+        if not r.get("id"):
+            raise ValueError("Each row must have a non-empty 'id' to name the output file.")
+        fname = slugify(r["id"])
+        if fname in seen:
+            raise ValueError(f"Duplicate id after slugify: {fname}. Make ids unique.")
+        seen.add(fname)
+
+        out = args.outdir / f"{fname}.wav"
         run_one(
-            text=it["text"],
+            text=r["text"],
             out_file=out,
-            model_name=it.get("model_name"),
-            voice_name=it.get("voice_name"),
-            speed=it.get("speed"),
+            language=r.get("language"),
+            row_engine=r.get("engine"),
+            voice_name=r.get("voice_name"),
+            model_name=r.get("model_name"),
+            speed=r.get("speed"),
         )
+
 
 
 if __name__ == "__main__":

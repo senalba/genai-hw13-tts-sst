@@ -1,0 +1,62 @@
+[
+    {
+        "id": "en01",
+        "text": "All warfare is based on deception.",
+        "engine": "parler"
+    },
+    {
+        "id": "en02",
+        "text": "The supreme art of war is to subdue the enemy without fighting.",
+        "engine": "parler"
+    },
+    {
+        "id": "en03",
+        "text": "If you know the enemy and know yourself, you need not fear the result of a hundred battles.",
+        "engine": "parler"
+    },
+    {
+        "id": "en04",
+        "text": "If you know yourself but not the enemy, for every victory gained you will also suffer a defeat.",
+        "engine": "parler"
+    },
+    {
+        "id": "en05",
+        "text": "If you know neither the enemy nor yourself, you will succumb in every battle.",
+        "engine": "parler"
+    },
+    {
+        "id": "en06",
+        "text": "Victorious warriors win first and then go to war, while defeated warriors go to war first and then seek to win.",
+        "engine": "parler"
+    },
+    {
+        "id": "uk01",
+        "text": "Війна є справою життєво важливою для держави. Вона вирішує питання життя і смерті, шляху до безпеки або до загибелі.",
+        "engine": "space"
+    },
+    {
+        "id": "uk02",
+        "text": "Найвища майстерність полягає в тому, щоб перемогти ворога без бою.",
+        "engine": "space"
+    },
+    {
+        "id": "uk03",
+        "text": "Знаючи ворога і знаючи себе, ви не будете переможені у сотнях битв.",
+        "engine": "space"
+    },
+    {
+        "id": "uk04",
+        "text": "Якщо знаєш ворога, але не знаєш себе, ти зазнаєш поразки в кожній другій битві.",
+        "engine": "space"
+    },
+    {
+        "id": "uk05",
+        "text": "Якщо не знаєш ані ворога, ані себе, ти приречений на поразку в кожній битві.",
+        "engine": "space"
+    },
+    {
+        "id": "uk06",
+        "text": "Мудрий воїн виграє спочатку, а вже потім іде на битву. Немудрий воїн іде в бій, а потім шукає перемоги.",
+        "engine": "space"
+    }
+]
